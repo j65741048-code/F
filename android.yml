@@ -2,7 +2,8 @@
 # Ship Launcher - one-file APK builder
 #
 # Put this file in your GitHub repo at:  .github/workflows/build-ships-launcher.yml
-# Then: Actions tab -> "Build Ship Launcher APK" -> Run workflow.
+# It builds automatically on every commit/push, or manually via
+# Actions tab -> "Build Ship Launcher APK" -> Run workflow.
 # When it finishes, download the "ship-launcher-apk" artifact (contains the APK).
 #
 # What it does:
@@ -19,12 +20,17 @@
 name: Build Ship Launcher APK
 
 on:
+  push:
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       ref:
         description: "Upstream ZalithLauncher2 branch or tag"
         default: "main"
-        required: true
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -35,19 +41,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ZalithLauncher/ZalithLauncher2
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || 'main' }}
           submodules: recursive
           path: src
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Prepare Gradle and Android SDK
         run: |
           mkdir -p ~/.gradle
-          printf '%s\n' 'org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' 'org.gradle.parallel=true' 'org.gradle.daemon=false' >> ~/.gradle/gradle.properties
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' 'org.gradle.parallel=true' 'org.gradle.daemon=false' 'kotlin.daemon.jvmargs=-Xmx3g' >> ~/.gradle/gradle.properties
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Add sinking ships background
@@ -61,6 +67,8 @@ jobs:
           MODULE="${MAIN%%/src/main/*}"
           DEST="$MODULE/src/main/java/net/shipsink"
           mkdir -p "$DEST"
+          echo "SHIPS_DIR=$DEST" >> "$GITHUB_ENV"
+          echo "SHIPS_MAIN=$MAIN" >> "$GITHUB_ENV"
           cat > "$DEST/ShipsBackground.kt" << 'KT'
           package net.shipsink
 
@@ -339,13 +347,53 @@ jobs:
                   print("patched", p)
           PY
 
-      - name: Build release APK
+      - name: Build APK (with automatic fallbacks)
         working-directory: src
         env:
           CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace || ./gradlew assembleDebug --no-daemon --stacktrace
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          summarize() {
+            {
+              echo "### $1 FAILED"
+              echo '```'
+              grep -E -A8 'What went wrong' "$2" | head -40
+              grep -E '^e: ' "$2" | head -20
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          try() {  # $1 = label, $2 = gradle task
+            echo "::group::$1"
+            ./gradlew "$2" --no-daemon --stacktrace > "$GITHUB_WORKSPACE/logs/$1.log" 2>&1
+            rc=$?
+            tail -n 30 "$GITHUB_WORKSPACE/logs/$1.log"
+            echo "::endgroup::"
+            if [ $rc -ne 0 ]; then summarize "$1" "$GITHUB_WORKSPACE/logs/$1.log"; fi
+            return $rc
+          }
+
+          if try ships-release assembleRelease; then exit 0; fi
+          if try ships-debug assembleDebug; then exit 0; fi
+
+          if [ -n "$SHIPS_DIR" ]; then
+            echo "Removing ships background to check whether it caused the failure"
+            git checkout -- "$SHIPS_MAIN" || true
+            rm -rf "$SHIPS_DIR"
+          fi
+          if try stock-release assembleRelease; then exit 0; fi
+          if try stock-debug assembleDebug; then exit 0; fi
+          exit 1
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/*.log
+          if-no-files-found: ignore
 
       - name: Sign APK
         run: |
